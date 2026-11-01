@@ -11,6 +11,8 @@ An online table for a fantasy RPG group that plays from different cities. Everyo
 - **Initiative tracker**: roll your own initiative, add foes with HP, and step through turns.
 - **AI Dungeon Master**: four tones (Heroic, Grim, Comedic, Spooky). It reads the party's sheets and backstories, puts roll buttons in front of the right player, adds monsters to initiative and the map, and keeps going once everyone has rolled.
 - **Human DM mode**: the DM narrates in the story log and can make secret rolls.
+- **Hero codes (cloud saves)**: tap "Save to cloud" to get a secret code like `TOWER-CLOAK-REED-TALON-5686`. Enter it on any phone or computer to load your characters. Edits and deletions sync automatically.
+- **Saved rooms**: a room's story, rolls, initiative and map are saved to the cloud, so the same room code continues next session.
 
 ## Setup
 
@@ -22,7 +24,7 @@ npm run dev
 
 | Variable | What it does |
 | --- | --- |
-| `NEXT_PUBLIC_SUPABASE_URL`, `NEXT_PUBLIC_SUPABASE_ANON_KEY` | Live sync across devices through Supabase Realtime (broadcast and presence; no tables or migrations needed). Without these, rooms only sync between tabs in the same browser. |
+| `NEXT_PUBLIC_SUPABASE_URL`, `NEXT_PUBLIC_SUPABASE_ANON_KEY` | Live sync across devices (Supabase Realtime), hero-code character saves, and saved rooms. Run `supabase/migrations/*.sql` on the project first. Without these, everything stays on one device. |
 | `ANTHROPIC_API_KEY` | Turns on the AI Dungeon Master (`/api/dm`). |
 | `DM_MODEL` | Optional. Changes the model the AI DM uses (default `claude-sonnet-5-5`). |
 

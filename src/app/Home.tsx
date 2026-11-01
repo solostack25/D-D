@@ -4,7 +4,9 @@ import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { useMemo, useState } from "react";
 import { Avatar, Logo } from "@/components/ui";
-import { deleteCharacter, derive, loadCharacters, type Character } from "@/lib/character";
+import HeroVault from "@/components/HeroVault";
+import { deleteCharacter, derive, type Character } from "@/lib/character";
+import { useCharacters } from "@/lib/cloud";
 import { useHydrated } from "@/lib/hooks";
 import { makeRoomCode, realtimeEnabled } from "@/lib/room";
 import { SRD_ATTRIBUTION } from "@/lib/srd";
@@ -18,8 +20,8 @@ const TONES = ["Heroic", "Grim", "Comedic", "Spooky"];
 export default function Home() {
   const router = useRouter();
   const hydrated = useHydrated();
-  const [version, setVersion] = useState(0);
-  const chars: Character[] = useMemo(() => (hydrated && version >= 0 ? loadCharacters() : []), [hydrated, version]);
+  const raw = useCharacters(hydrated);
+  const chars: Character[] = useMemo(() => JSON.parse(raw) as Character[], [raw]);
   const newId = useMemo(() => (hydrated ? new URLSearchParams(window.location.search).get("created") : null), [hydrated]);
   const [mode, setMode] = useState<"ai" | "human">("ai");
   const [tone, setTone] = useState("Heroic");
@@ -109,6 +111,7 @@ export default function Home() {
             <h2 className="font-display text-2xl font-bold text-parch-hi">Your characters</h2>
             <Link href="/create" className="text-sm font-semibold">+ Create a character</Link>
           </div>
+          {hydrated && <HeroVault hasCharacters={chars.length > 0} />}
           {chars.length === 0 ? (
             <Link href="/create" className="flex flex-col items-center gap-2 rounded-2xl border-2 border-dashed border-line-2 p-10 text-center no-underline">
               <span className="font-display text-xl font-bold text-parch-hi">No heroes yet</span>
@@ -129,7 +132,7 @@ export default function Home() {
                     </div>
                     <div className="flex items-center justify-between border-t border-line pt-3 text-[13px] text-soft">
                       <span>HP {d.maxHp} · AC {d.ac}</span>
-                      <button type="button" className="text-muted hover:text-bad" onClick={() => { if (confirm(`Delete ${c.name}?`)) { deleteCharacter(c.id); setVersion((v) => v + 1); } }}>Delete</button>
+                      <button type="button" className="text-muted hover:text-bad" onClick={() => { if (confirm(`Delete ${c.name}?`)) { deleteCharacter(c.id); } }}>Delete</button>
                     </div>
                   </div>
                 );

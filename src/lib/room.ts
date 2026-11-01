@@ -1,6 +1,7 @@
 "use client";
 
-import { createClient, type RealtimeChannel } from "@supabase/supabase-js";
+import type { RealtimeChannel } from "@supabase/supabase-js";
+import { supabase, supabaseEnabled } from "./supabase";
 import { useCallback, useEffect, useReducer, useRef, useState } from "react";
 import type { PublicCharacter } from "./character";
 
@@ -159,15 +160,13 @@ interface Transport {
   live: boolean; // true = Supabase (cross-device), false = this browser only
 }
 
-const SUPABASE_URL = process.env.NEXT_PUBLIC_SUPABASE_URL;
-const SUPABASE_KEY = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY;
-export const realtimeEnabled = Boolean(SUPABASE_URL && SUPABASE_KEY);
+export const realtimeEnabled = supabaseEnabled;
 
 function supabaseTransport(code: string, clientId: string, onMsg: (m: Msg) => void, onMembers: (m: Member[]) => void): Transport {
-  const sb = createClient(SUPABASE_URL!, SUPABASE_KEY!, { auth: { persistSession: false } });
+  const sb = supabase()!;
   let meta: Member | null = null;
   let ready = false;
-  const ch: RealtimeChannel = sb.channel(`tavernlight:${code}`, { config: { broadcast: { self: true }, presence: { key: clientId } } });
+  const ch: RealtimeChannel = sb.channel(`tavernlight:${code}`, { config: { broadcast: { self: false }, presence: { key: clientId } } });
   ch.on("broadcast", { event: "msg" }, ({ payload }) => onMsg(payload as Msg));
   ch.on("presence", { event: "sync" }, () => {
     const st = ch.presenceState<Member>();
@@ -182,7 +181,10 @@ function supabaseTransport(code: string, clientId: string, onMsg: (m: Msg) => vo
   });
   return {
     live: true,
-    send: (msg) => ch.send({ type: "broadcast", event: "msg", payload: msg }),
+    send: (msg) => {
+      onMsg(msg); // apply locally right away; others get it over the socket
+      ch.send({ type: "broadcast", event: "msg", payload: msg });
+    },
     track: (m) => {
       meta = m;
       if (ready) ch.track(m);
@@ -275,6 +277,30 @@ export function useRoom(code: string, me: Member | null) {
     try {
       localStorage.setItem(stateKey(code), JSON.stringify(state));
     } catch {}
+  }, [code, state]);
+
+  // Load the saved campaign from the cloud, so a room picks up where it left off next session.
+  useEffect(() => {
+    const sb = supabase();
+    if (!sb) return;
+    let alive = true;
+    sb.rpc("room_get", { p_code: code }).then(({ data }) => {
+      const saved = data as RoomState | null;
+      if (alive && saved && saved.updatedAt > stateRef.current.updatedAt) dispatch({ replace: saved });
+    });
+    return () => {
+      alive = false;
+    };
+  }, [code]);
+
+  // Save the room to the cloud a few seconds after it changes.
+  useEffect(() => {
+    const sb = supabase();
+    if (!sb || state.updatedAt === 0 || state.log.some((l) => l.streaming)) return;
+    const t = setTimeout(() => {
+      sb.rpc("room_put", { p_code: code, p_state: { ...state, rolls: state.rolls.slice(0, 30), log: state.log.slice(-150) } }).then(() => {});
+    }, 2500 + Math.random() * 1500);
+    return () => clearTimeout(t);
   }, [code, state]);
 
   useEffect(() => {

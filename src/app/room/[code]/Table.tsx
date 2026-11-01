@@ -3,8 +3,10 @@
 import Link from "next/link";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Avatar, D20, HpBar, Label, Logo } from "@/components/ui";
-import { checkMod, derive, fmt, getCharacter, loadCharacters, saveCharacter, toPublic, type Character } from "@/lib/character";
+import { checkMod, derive, fmt, getCharacter, saveCharacter, toPublic, type Character } from "@/lib/character";
 import { roll as rollExpr } from "@/lib/dice";
+import HeroVault from "@/components/HeroVault";
+import { useCharacters } from "@/lib/cloud";
 import { useHydrated } from "@/lib/hooks";
 import { getClientId, newId, useRoom, type InitEntry, type LogEntry, type Member, type RollEntry, type Token } from "@/lib/room";
 import { ABILITIES, ABILITY_NAMES, SKILLS, type Skill } from "@/lib/srd";
@@ -45,7 +47,8 @@ const stripTags = (text: string) =>
 export default function Table({ code }: { code: string }) {
   const ready = useHydrated();
   const clientId = useMemo(() => (ready ? getClientId() : null), [ready]);
-  const myChars = useMemo(() => (ready ? loadCharacters() : []), [ready]);
+  const rawChars = useCharacters(ready);
+  const myChars = useMemo(() => JSON.parse(rawChars) as Character[], [rawChars]);
   const savedSeat = useMemo(() => {
     if (!ready) return null;
     try {
@@ -57,7 +60,7 @@ export default function Table({ code }: { code: string }) {
   const [seatState, setSeat] = useState<Seat | null | undefined>(undefined);
   const seat = seatState === undefined ? savedSeat : seatState;
   const seatCharId = seat?.characterId ?? null;
-  const savedChar = useMemo(() => (seatCharId ? getCharacter(seatCharId) : null), [seatCharId]);
+  const savedChar = useMemo(() => (seatCharId ? myChars.find((c) => c.id === seatCharId) ?? getCharacter(seatCharId) : null), [seatCharId, myChars]);
   const [charState, setChar] = useState<Character | null | undefined>(undefined);
   const char = charState === undefined || (charState && charState.id !== seatCharId) ? savedChar : charState;
 
@@ -96,6 +99,7 @@ function SeatPicker({ code, chars, onPick }: { code: string; chars: Character[];
           <h1 className="font-display text-4xl font-bold text-parch-hi md:text-5xl">Take your seat</h1>
           <p className="text-muted">Pick the character you&apos;re playing tonight.</p>
         </div>
+        <HeroVault hasCharacters={chars.length > 0} compact />
         <div className="grid grid-cols-[repeat(auto-fill,minmax(260px,1fr))] gap-4">
           {chars.map((c) => {
             const d = derive(c);

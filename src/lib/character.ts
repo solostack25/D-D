@@ -17,6 +17,7 @@ export interface Character {
   hp: number; // current HP
   notes: string;
   createdAt: number;
+  updatedAt?: number;
 }
 
 export const mod = (score: number) => Math.floor((score - 10) / 2);
@@ -64,28 +65,58 @@ export function checkMod(c: Character, check: string): number {
 }
 
 const KEY = "tavernlight.characters.v1";
+const TOMBSTONES = "tavernlight.deleted.v1";
+export const CHARACTERS_CHANGED = "tavernlight:characters";
+
+function readJSON<T>(key: string, fallback: T): T {
+  if (typeof window === "undefined") return fallback;
+  try {
+    return (JSON.parse(localStorage.getItem(key) ?? "null") as T) ?? fallback;
+  } catch {
+    return fallback;
+  }
+}
+
+function write(all: Character[], tombs: Record<string, number>, notify = true) {
+  try {
+    localStorage.setItem(KEY, JSON.stringify(all));
+    localStorage.setItem(TOMBSTONES, JSON.stringify(tombs));
+  } catch {}
+  if (notify && typeof window !== "undefined") window.dispatchEvent(new Event(CHARACTERS_CHANGED));
+}
 
 export function loadCharacters(): Character[] {
-  if (typeof window === "undefined") return [];
-  try {
-    return JSON.parse(localStorage.getItem(KEY) ?? "[]") as Character[];
-  } catch {
-    return [];
-  }
+  return readJSON<Character[]>(KEY, []);
+}
+
+export function loadTombstones(): Record<string, number> {
+  return readJSON<Record<string, number>>(TOMBSTONES, {});
 }
 
 export function saveCharacter(c: Character) {
   const all = loadCharacters().filter((x) => x.id !== c.id);
-  all.unshift(c);
-  try {
-    localStorage.setItem(KEY, JSON.stringify(all));
-  } catch {}
+  all.unshift({ ...c, updatedAt: Date.now() });
+  write(all, loadTombstones());
 }
 
 export function deleteCharacter(id: string) {
-  try {
-    localStorage.setItem(KEY, JSON.stringify(loadCharacters().filter((x) => x.id !== id)));
-  } catch {}
+  write(loadCharacters().filter((x) => x.id !== id), { ...loadTombstones(), [id]: Date.now() });
+}
+
+/** Merge characters from the cloud into this device. Newest edit wins; deletions stick. */
+export function mergeCharacters(remote: Character[], remoteTombs: Record<string, number>) {
+  const tombs = { ...remoteTombs };
+  for (const [id, t] of Object.entries(loadTombstones())) tombs[id] = Math.max(t, tombs[id] ?? 0);
+  const byId = new Map<string, Character>();
+  for (const c of [...loadCharacters(), ...remote]) {
+    const cur = byId.get(c.id);
+    if (!cur || (c.updatedAt ?? c.createdAt) > (cur.updatedAt ?? cur.createdAt)) byId.set(c.id, c);
+  }
+  const all = [...byId.values()]
+    .filter((c) => !tombs[c.id] || (c.updatedAt ?? c.createdAt) > tombs[c.id])
+    .sort((a, b) => (b.updatedAt ?? b.createdAt) - (a.updatedAt ?? a.createdAt));
+  write(all, tombs, false);
+  return all;
 }
 
 export function getCharacter(id: string) {
