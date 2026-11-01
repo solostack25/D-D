@@ -49,7 +49,7 @@ export default function Home() {
           <div className="flex max-w-[640px] flex-col gap-3">
             <span className="text-xs font-bold tracking-[2.5px] text-ember">YOUR ONLINE TABLE</span>
             <h1 className="font-display text-5xl font-bold leading-[1.05] text-parch-hi md:text-6xl">Gather the party.</h1>
-            <p className="text-lg leading-relaxed text-muted">Houston, New York, Colorado — one table. Shared dice everyone sees land, a battle map, and an AI Dungeon Master for nights nobody wants to run it.</p>
+            <p className="text-lg leading-relaxed text-muted">One table, wherever you are. Shared dice everyone sees land, a battle map, and an AI Dungeon Master for nights nobody wants to run it.</p>
           </div>
           <form onSubmit={joinRoom} className="flex flex-col gap-2 rounded-2xl border border-gold-line bg-gold-panel p-5">
             <label htmlFor="join" className="text-xs font-bold tracking-[1.5px] text-muted">JOIN WITH A ROOM CODE</label>
