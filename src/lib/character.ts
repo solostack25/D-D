@@ -1,3 +1,4 @@
+import { CAST_ABILITY, classFeatures, classWeapons, spellSlots, type Item } from "./rules";
 import { ABILITIES, BACKGROUNDS, CLASSES, SKILLS, SPECIES, type Ability, type Skill } from "./srd";
 
 export type Scores = Record<Ability, number>;
@@ -18,15 +19,42 @@ export interface Character {
   notes: string;
   createdAt: number;
   updatedAt?: number;
+  // added with the sheet upgrade — older characters get defaults from normalize()
+  asi?: Partial<Record<Ability, number>>; // ability score improvements from leveling
+  hpRolls?: number[]; // HP gained at each level after 1st (rolled or average)
+  spells?: string[]; // prepared spell ids
+  slotsUsed?: number[]; // index 0 = 1st-level slots used
+  featureUsed?: Record<string, number>;
+  inventory?: Item[];
+  gold?: number;
+  conditions?: string[];
+  diceSkin?: string;
+  lootSeen?: string[]; // AI loot tags already applied
+}
+
+export function normalize(c: Character): Required<Pick<Character, "asi" | "hpRolls" | "spells" | "slotsUsed" | "featureUsed" | "inventory" | "gold" | "conditions" | "diceSkin" | "lootSeen">> & Character {
+  return {
+    ...c,
+    asi: c.asi ?? {},
+    hpRolls: c.hpRolls ?? [],
+    spells: c.spells ?? [],
+    slotsUsed: c.slotsUsed ?? [],
+    featureUsed: c.featureUsed ?? {},
+    inventory: c.inventory ?? [],
+    gold: c.gold ?? 0,
+    conditions: c.conditions ?? [],
+    diceSkin: c.diceSkin ?? "gilded",
+    lootSeen: c.lootSeen ?? [],
+  };
 }
 
 export const mod = (score: number) => Math.floor((score - 10) / 2);
 export const fmt = (n: number) => (n >= 0 ? `+${n}` : `${n}`);
 export const profBonus = (level: number) => 2 + Math.floor((level - 1) / 4);
 
-export function finalScores(c: Pick<Character, "base" | "bonus">): Scores {
+export function finalScores(c: Pick<Character, "base" | "bonus" | "asi">): Scores {
   const out = { ...c.base };
-  for (const a of ABILITIES) out[a] = Math.min(20, out[a] + (c.bonus[a] ?? 0));
+  for (const a of ABILITIES) out[a] = Math.min(20, out[a] + (c.bonus[a] ?? 0) + (c.asi?.[a] ?? 0));
   return out;
 }
 
@@ -38,7 +66,8 @@ export function derive(c: Character) {
   const m = (a: Ability) => mod(s[a]);
   const prof = profBonus(c.level);
   const avg = cls.hitDie / 2 + 1;
-  let maxHp = cls.hitDie + m("CON") + (c.level - 1) * (avg + m("CON"));
+  let maxHp = cls.hitDie + m("CON");
+  for (let lv = 2; lv <= c.level; lv++) maxHp += (c.hpRolls?.[lv - 2] ?? avg) + m("CON");
   if (species.id === "dwarf") maxHp += c.level; // Dwarven Toughness
   maxHp = Math.max(1, maxHp);
   const dex = cls.ac.dexCap === null ? m("DEX") : Math.min(m("DEX"), cls.ac.dexCap);
@@ -47,7 +76,14 @@ export function derive(c: Character) {
   const skillMod = (sk: Skill) => m(SKILLS[sk]) + (skills.has(sk) ? prof : 0);
   const saveMod = (a: Ability) => m(a) + (cls.saves.includes(a) ? prof : 0);
   const attackMod = m(cls.attack) + prof;
-  return { cls, species, bg, scores: s, m, prof, maxHp, ac, initiative: m("DEX"), skills, skillMod, saveMod, attackMod, speed: species.speed };
+  const castAbility = CAST_ABILITY[cls.id];
+  const castMod = castAbility ? m(castAbility) : 0;
+  const mods = Object.fromEntries(ABILITIES.map((a) => [a, m(a)])) as Record<Ability, number>;
+  return {
+    cls, species, bg, scores: s, m, prof, maxHp, ac, initiative: m("DEX"), skills, skillMod, saveMod, attackMod, speed: species.speed,
+    castAbility, castMod, spellAttack: castMod + prof, spellDC: 8 + prof + castMod,
+    slots: spellSlots(cls.id, c.level), features: classFeatures(cls.id, c.level, mods), weapons: classWeapons(cls.id, c.level),
+  };
 }
 
 /** Modifier for a named check: an ability, a skill, "<ability> save", "Attack", "Initiative". */
@@ -138,6 +174,9 @@ export interface PublicCharacter {
   maxHp: number;
   initMod: number;
   scores: Scores;
+  level: number;
+  conditions: string[];
+  diceSkin: string;
 }
 
 export function toPublic(c: Character): PublicCharacter {
@@ -153,5 +192,8 @@ export function toPublic(c: Character): PublicCharacter {
     maxHp: d.maxHp,
     initMod: d.initiative,
     scores: d.scores,
+    level: c.level,
+    conditions: c.conditions ?? [],
+    diceSkin: c.diceSkin ?? "gilded",
   };
 }

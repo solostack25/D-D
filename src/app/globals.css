@@ -87,3 +87,10 @@ body {
 @media (prefers-reduced-motion: reduce) {
   .tumble-a, .tumble-b, .crit-glow, .turn-pulse, .speak, .rise, .flicker { animation: none; }
 }
+
+@keyframes floatUp {
+  0% { transform: translateY(0) scale(0.6); opacity: 0; }
+  12% { transform: translateY(-20px) scale(1.15); opacity: 1; }
+  100% { transform: translateY(-260px) scale(1); opacity: 0; }
+}
+.float-up { animation: floatUp 2.6s ease-out forwards; }

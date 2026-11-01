@@ -2,14 +2,18 @@
 
 import Link from "next/link";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { Avatar, D20, HpBar, Label, Logo } from "@/components/ui";
-import { checkMod, derive, fmt, getCharacter, saveCharacter, toPublic, type Character } from "@/lib/character";
-import { roll as rollExpr } from "@/lib/dice";
+import Dice3D, { type Throw } from "@/components/Dice3D";
 import HeroVault from "@/components/HeroVault";
+import { Avatar, D20, HpBar, Label, Logo } from "@/components/ui";
+import { checkMod, derive, fmt, getCharacter, normalize, saveCharacter, toPublic, type Character } from "@/lib/character";
+import { formatParts, roll as rollExpr } from "@/lib/dice";
+import { modeFromConditions, skinById, type RollMode } from "@/lib/rules";
 import { useCharacters } from "@/lib/cloud";
 import { useHydrated } from "@/lib/hooks";
-import { getClientId, newId, useRoom, type InitEntry, type LogEntry, type Member, type RollEntry, type Token } from "@/lib/room";
-import { ABILITIES, ABILITY_NAMES, SKILLS, type Skill } from "@/lib/srd";
+import { getClientId, newId, useRoom, type InitEntry, type LogEntry, type Member, type Msg, type RollEntry, type Token } from "@/lib/room";
+import { ABILITIES, ABILITY_NAMES, SKILLS, type Ability, type Skill } from "@/lib/srd";
+import { JournalPanel, REACTIONS, RecapsPanel, StatsPanel } from "./CampaignPanels";
+import SheetPanel, { type Engine, type RollOpts } from "./SheetPanel";
 
 const COLS = 16;
 const ROWS = 10;
@@ -26,6 +30,11 @@ interface RollReq { who: string; check: string; target: string | null; idx: numb
 const ROLL_RE = /\[ROLL ([^:\]]+):\s*([^\]]+?)\]/g;
 const FOE_RE = /\[FOE ([^|\]]+)\|\s*HP\s*(\d+)\s*\|\s*AC\s*(\d+)\s*\|\s*INIT\s*(\d+)\s*\]/gi;
 const SCENE_RE = /\[SCENE ([^\]]+)\]/i;
+const NPC_RE = /\[NPC ([^:\]]+):\s*([^\]]*)\]/gi;
+const QUEST_RE = /\[QUEST ([^\]]+)\]/gi;
+const QUEST_DONE_RE = /\[QUEST-DONE ([^\]]+)\]/gi;
+const LOOT_RE = /\[LOOT ([^:\]]+):\s*([^\]]+)\]/gi;
+const GOLD_RE = /\[GOLD ([^:\]]+):\s*(\d+)\s*\]/gi;
 
 function parseRequests(text: string): RollReq[] {
   const out: RollReq[] = [];
@@ -40,7 +49,19 @@ function parseRequests(text: string): RollReq[] {
   return out;
 }
 const stripTags = (text: string) =>
-  text.replace(new RegExp(ROLL_RE.source, "g"), "").replace(new RegExp(FOE_RE.source, "gi"), "").replace(new RegExp(SCENE_RE.source, "gi"), "").replace(/[ \t]+\n/g, "\n").replace(/\n{3,}/g, "\n\n").trim();
+  [ROLL_RE, FOE_RE, SCENE_RE, NPC_RE, QUEST_DONE_RE, QUEST_RE, LOOT_RE, GOLD_RE]
+    .reduce((t, re) => t.replace(new RegExp(re.source, "gi"), ""), text)
+    .replace(/[ \t]+\n/g, "\n")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+
+/** Short "who got what" lines for loot tags, shown under the narration. */
+function lootLines(text: string) {
+  const out: string[] = [];
+  for (const m of text.matchAll(new RegExp(LOOT_RE.source, "gi"))) out.push(`${m[1].trim()} receives ${m[2].trim()}`);
+  for (const m of text.matchAll(new RegExp(GOLD_RE.source, "gi"))) out.push(`${m[1].trim()} receives ${m[2]} gp`);
+  return out;
+}
 
 // ---------------------------------------------------------------------------
 
@@ -132,15 +153,40 @@ function SeatPicker({ code, chars, onPick }: { code: string; chars: Character[];
 // ---------------------------------------------------------------------------
 
 type Room = ReturnType<typeof useRoom>;
+type StoryTab = "Story" | "Journal" | "Recaps" | "Stats";
 
-function Session({ code, seat, char, setChar, me, room, leave }: {
+function Session({ code, seat, char: rawChar, setChar, me, room, leave }: {
   code: string; seat: Seat; char: Character | null; setChar: (c: Character) => void; me: Member; room: Room; leave: () => void;
 }) {
-  const { state, members, send, live } = room;
+  const { state, members, send, live, onEvent, saveNow } = room;
+  const char = useMemo(() => (rawChar ? normalize(rawChar) : null), [rawChar]);
   const isDM = seat.role === "dm";
   const myName = char?.name ?? (isDM ? "DM" : "Spectator");
   const myColor = char?.color ?? "#E8B84A";
   const aiMode = state.mode === "ai";
+
+  // ---- character updates (saved locally + synced to the cloud) ----
+  const charRef = useRef(char);
+  useEffect(() => {
+    charRef.current = char;
+  }, [char]);
+  const stateRef = useRef(state);
+  useEffect(() => {
+    stateRef.current = state;
+  }, [state]);
+
+  const update = useCallback((fn: (c: ReturnType<typeof normalize>) => Character) => {
+    const cur = charRef.current;
+    if (!cur) return;
+    const next = normalize(fn(normalize(cur)));
+    const max = derive(next).maxHp;
+    next.hp = Math.max(0, Math.min(max, next.hp));
+    charRef.current = next;
+    saveCharacter(next);
+    setChar(next);
+    const st = stateRef.current;
+    if (st.init.some((x) => x.id === next.id) && next.hp !== cur.hp) send({ type: "init-patch", id: next.id, hp: next.hp });
+  }, [send, setChar]);
 
   // ---- first-load settings from the create-room link ----
   const booted = useRef(false);
@@ -159,53 +205,138 @@ function Session({ code, seat, char, setChar, me, room, leave }: {
   useEffect(() => {
     if (!char) return;
     const t = setTimeout(() => {
-      if (state.tokens[char.id]) return;
-      const taken = new Set(Object.values(state.tokens).map((k) => `${k.x},${k.y}`));
+      if (stateRef.current.tokens[char.id]) return;
+      const taken = new Set(Object.values(stateRef.current.tokens).map((k) => `${k.x},${k.y}`));
       let x = 1, y = 2;
       while (taken.has(`${x},${y}`)) { y++; if (y >= ROWS - 1) { y = 2; x++; } }
       send({ type: "token", id: char.id, token: { x, y, label: char.name[0].toUpperCase(), color: char.color, kind: "pc", name: char.name } });
     }, 1200);
     return () => clearTimeout(t);
-  }, [char, state.tokens, send]);
+  }, [char, send]);
 
-  // ---- party: everyone present with a character, plus offline tokens ----
+  // ---- party ----
   const party = useMemo(() => {
     const seen = new Map<string, Member>();
     for (const m of members) if (m.character) seen.set(m.character.id, m);
     if (me.character) seen.set(me.character.id, me);
     return [...seen.values()];
   }, [members, me]);
+  const partyChars = useMemo(() => party.map((m) => m.character!), [party]);
   const dmPresent = members.some((m) => m.role === "dm") || isDM;
 
-  // ---- dice ----
+  const log = useCallback((text: string, kind: LogEntry["kind"] = "system") => {
+    send({ type: "log", entry: { id: newId(), kind, who: myName, color: myColor, text, at: Date.now() } });
+  }, [send, myName, myColor]);
+
+  // ---- dice engine ----
   const [die, setDie] = useState(20);
   const [count, setCount] = useState(1);
   const [check, setCheck] = useState<string>("Attack");
+  const [trayMode, setTrayMode] = useState<"auto" | RollMode>("auto");
   const [secret, setSecret] = useState(false);
-  const [rolling, setRolling] = useState(false);
-  const [rollCount, setRollCount] = useState(0);
+  const [busy, setBusy] = useState(false);
+  const busyRef = useRef(false);
   const [last, setLast] = useState<RollEntry | null>(null);
+
+  const roll = useCallback((o: RollOpts & { after?: (e: RollEntry) => void }) => new Promise<RollEntry | null>((resolve) => {
+    if (busyRef.current) return resolve(null);
+    const c = charRef.current;
+    let mode: RollMode = "normal";
+    let reason = "";
+    const isD20 = /^1?d20([+-]\d+)?$/i.test(o.expr.replace(/\s/g, ""));
+    if (isD20 && (o.kind === "attack" || o.kind === "check" || o.kind === "save")) {
+      if (trayMode !== "auto") {
+        mode = trayMode;
+        reason = trayMode === "adv" ? "Advantage" : trayMode === "dis" ? "Disadvantage" : "";
+      } else if (c) {
+        const r = modeFromConditions(c.conditions ?? [], o.kind, o.ability);
+        if (r.autoFail) {
+          log(`${myName} automatically fails the ${o.label} (${r.reason.split(":")[0]}).`);
+          return resolve(null);
+        }
+        mode = r.mode;
+        reason = r.reason;
+      }
+    }
+    busyRef.current = true;
+    setBusy(true);
+    const r = rollExpr(o.expr, mode, o.crit);
+    const label = reason ? `${o.label} · ${reason}` : o.label;
+    const entry: RollEntry = {
+      id: newId(), who: myName, color: myColor, label, expr: o.crit ? `${o.expr} (crit)` : o.expr,
+      dice: r.parts.map((p) => p.value), modifier: r.modifier, total: r.total, nat: r.nat, hidden: o.hidden, req: o.req,
+      byClient: me.clientId, at: Date.now(), parts: r.parts.map(({ sides, value, dropped }) => ({ sides, value, dropped })), mode, skin: c?.diceSkin ?? "gilded", kind: o.kind,
+    };
+    setLast(entry);
+    send({ type: "roll", entry });
+    setTimeout(() => {
+      if (!o.hidden) {
+        const nat = r.nat === 20 ? " — NATURAL 20!" : r.nat === 1 ? " — natural 1" : "";
+        const verb = o.kind === "heal" ? "heals" : o.kind === "damage" ? "damage" : "";
+        send({ type: "log", entry: { id: newId(), kind: "roll", who: myName, color: myColor, text: `${label}: ${r.total}${verb === "heals" ? " HP" : ""} (${entry.expr} → ${formatParts(r.parts)}${r.modifier ? ` ${fmt(r.modifier)}` : ""})${nat}`, at: Date.now() } });
+      }
+      busyRef.current = false;
+      setBusy(false);
+      o.after?.(entry);
+      resolve(entry);
+    }, 1550);
+  }), [trayMode, log, myName, myColor, me.clientId, send]);
+
+  const engine: Engine = useMemo(() => ({ roll, busy }), [roll, busy]);
+
+  // ---- 3D dice for everyone's rolls ----
+  const newestRoll = state.rolls[0];
+  const throwData: Throw | null = useMemo(() => {
+    if (!newestRoll) return null;
+    const hide = newestRoll.hidden && newestRoll.byClient !== me.clientId;
+    const parts = newestRoll.parts ?? newestRoll.dice.map((v) => ({ sides: 20, value: v }));
+    return {
+      id: newestRoll.id, who: newestRoll.who, color: newestRoll.color, label: hide ? "secret roll" : newestRoll.label,
+      total: hide ? "?" : newestRoll.total, skin: newestRoll.skin, nat: hide ? null : newestRoll.nat, at: newestRoll.at,
+      parts: hide ? parts.map((p) => ({ ...p, value: Math.max(1, Math.ceil(p.sides / 2)) })) : parts,
+    };
+  }, [newestRoll, me.clientId]);
+
+  // ---- AI DM ----
   const busyDM = useRef(false);
   const [dmBusy, setDmBusy] = useState(false);
+  const [aiNote, setAiNote] = useState<string | null>(null);
+
+  const addFoes = useCallback((foes: InitEntry[]) => {
+    send({ type: "init-upsert", entries: foes });
+    const taken = new Set(Object.values(stateRef.current.tokens).map((k) => `${k.x},${k.y}`));
+    let x = COLS - 3, y = 2;
+    for (const f of foes) {
+      while (taken.has(`${x},${y}`)) { y++; if (y >= ROWS - 1) { y = 2; x--; } }
+      taken.add(`${x},${y}`);
+      send({ type: "token", id: f.id, token: { x, y, label: f.name.slice(0, 2).replace(/\s/g, ""), color: "#F06A5A", kind: "foe", name: f.name } });
+    }
+  }, [send]);
 
   const askDM = useCallback(async (action: string) => {
     if (busyDM.current) return;
     busyDM.current = true;
     setDmBusy(true);
+    setAiNote(null);
     const id = newId();
-    send({ type: "log-patch", id, text: "", streaming: true });
     let text = "";
-    let lastSent = 0;
     try {
+      await saveNow().catch(() => {});
+      const st = stateRef.current;
+      send({ type: "log-patch", id, text: "", streaming: true });
+      let lastSent = 0;
       const res = await fetch("/api/dm", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          tone: state.tone,
-          scene: state.scene,
+          room: code,
+          tone: st.tone,
+          scene: st.scene,
           action,
-          party: party.map((m) => ({ ...m.character!, backstory: m.character!.id === char?.id ? char?.notes : undefined })),
-          log: state.log.filter((l) => !l.streaming).slice(-40).map((l) => ({ who: l.who, kind: l.kind, text: l.text })),
+          recap: st.recaps[st.recaps.length - 1]?.text,
+          quests: st.journal.filter((j) => j.kind === "quest" && !j.done).map((j) => j.title),
+          party: party.map((m) => ({ ...m.character!, backstory: m.character!.id === charRef.current?.id ? charRef.current?.notes : undefined })),
+          log: st.log.filter((l) => !l.streaming).slice(-40).map((l) => ({ who: l.who, kind: l.kind, text: l.text })),
         }),
       });
       if (!res.ok || !res.body) {
@@ -225,98 +356,121 @@ function Session({ code, seat, char, setChar, me, room, leave }: {
         }
       }
       send({ type: "log-patch", id, text, streaming: false });
-      // apply structured tags
+      // structured tags
       const scene = text.match(SCENE_RE);
-      if (scene) send({ type: "settings", scene: scene[1].trim() });
+      if (scene) {
+        send({ type: "settings", scene: scene[1].trim() });
+        send({ type: "journal-add", entry: { id: newId(), kind: "place", title: scene[1].trim(), at: Date.now() } });
+      }
       const foes: InitEntry[] = [];
       for (const f of text.matchAll(new RegExp(FOE_RE.source, "gi"))) {
         foes.push({ id: newId(), name: f[1].trim(), hp: Number(f[2]), maxHp: Number(f[2]), ac: Number(f[3]), init: Number(f[4]), kind: "foe", color: "#F06A5A" });
       }
-      if (foes.length) {
-        addFoes(foes);
+      if (foes.length) addFoes(foes);
+      for (const n of text.matchAll(new RegExp(NPC_RE.source, "gi"))) send({ type: "journal-add", entry: { id: newId(), kind: "npc", title: n[1].trim(), text: n[2].trim(), at: Date.now() } });
+      for (const q of text.matchAll(new RegExp(QUEST_DONE_RE.source, "gi"))) {
+        const j = stateRef.current.journal.find((x) => x.kind === "quest" && x.title.toLowerCase() === q[1].trim().toLowerCase());
+        if (j) send({ type: "journal-update", id: j.id, patch: { done: true } });
       }
+      for (const q of text.matchAll(new RegExp(QUEST_RE.source, "gi"))) send({ type: "journal-add", entry: { id: newId(), kind: "quest", title: q[1].trim(), at: Date.now() } });
+      for (const l of lootLines(text)) send({ type: "journal-add", entry: { id: newId(), kind: "loot", title: l, at: Date.now() } });
     } catch {
       send({ type: "log-patch", id, text: text + "\n\n(Connection to the AI DM dropped.)", streaming: false });
     } finally {
       busyDM.current = false;
       setDmBusy(false);
     }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [send, state.tone, state.scene, state.log, party, char]);
+  }, [code, party, saveNow, send, addFoes]);
 
-  function addFoes(foes: InitEntry[]) {
-    send({ type: "init-upsert", entries: foes });
-    const taken = new Set(Object.values(state.tokens).map((k) => `${k.x},${k.y}`));
-    let x = COLS - 3, y = 2;
-    for (const f of foes) {
-      while (taken.has(`${x},${y}`)) { y++; if (y >= ROWS - 1) { y = 2; x--; } }
-      taken.add(`${x},${y}`);
-      send({ type: "token", id: f.id, token: { x, y, label: f.name.slice(0, 2).replace(/\s/g, ""), color: "#F06A5A", kind: "foe", name: f.name } });
-    }
-  }
-
-  function doRoll(opts: { sides: number; count?: number; label: string; mod?: number; req?: string; hidden?: boolean; after?: (e: RollEntry) => void }) {
-    if (rolling) return;
-    const n = opts.count ?? 1;
-    const mod = opts.mod ?? 0;
-    const r = rollExpr(`${n}d${opts.sides}${mod ? (mod > 0 ? `+${mod}` : mod) : ""}`);
-    setDie(opts.sides);
-    setRollCount((c) => c + 1);
-    setRolling(true);
-    setTimeout(() => {
-      const entry: RollEntry = {
-        id: newId(), who: myName, color: myColor, label: opts.label, expr: `${n}d${opts.sides}${mod ? fmt(mod) : ""}`,
-        dice: r.rolls, modifier: mod, total: r.total, nat: r.nat, hidden: opts.hidden, req: opts.req, byClient: me.clientId, at: Date.now(),
-      };
-      setLast(entry);
-      setRolling(false);
-      send({ type: "roll", entry });
-      if (!opts.hidden) {
-        const natTxt = r.nat === 20 ? " — NATURAL 20!" : r.nat === 1 ? " — natural 1" : "";
-        send({ type: "log", entry: { id: newId(), kind: "roll", who: myName, color: myColor, text: `${opts.label}: ${r.total} (${entry.expr} → ${r.rolls.join(", ")})${natTxt}`, at: Date.now() } });
-      }
-      opts.after?.(entry);
-    }, 900);
-  }
-
-  function trayRoll() {
-    if (die === 20 && count === 1 && char) {
-      const mod = checkMod(char, check);
-      if (check === "Initiative") return rollInitiative();
-      doRoll({ sides: 20, label: check, mod, hidden: isDM && secret });
-    } else {
-      doRoll({ sides: die, count, label: `${count}d${die}`, hidden: isDM && secret });
-    }
-  }
-
-  function rollInitiative() {
+  // ---- loot from the AI lands in my bag ----
+  useEffect(() => {
     if (!char) return;
-    const mod = checkMod(char, "Initiative");
-    doRoll({
-      sides: 20, label: "Initiative", mod,
-      after: (e) => {
-        const d = derive(char);
-        send({ type: "init-upsert", entries: [{ id: char.id, name: char.name, init: e.total, kind: "pc", color: char.color, hp: Math.min(char.hp, d.maxHp), maxHp: d.maxHp, ac: d.ac }] });
-      },
-    });
-  }
+    const name = char.name.toLowerCase();
+    const found: { key: string; item?: string; gold?: number }[] = [];
+    for (const l of state.log) {
+      if (l.kind !== "ai" || l.streaming) continue;
+      let i = 0;
+      for (const m of l.text.matchAll(new RegExp(LOOT_RE.source, "gi"))) {
+        const key = `${l.id}:l${i++}`;
+        if (m[1].trim().toLowerCase() === name && !char.lootSeen.includes(key)) found.push({ key, item: m[2].trim() });
+      }
+      i = 0;
+      for (const m of l.text.matchAll(new RegExp(GOLD_RE.source, "gi"))) {
+        const key = `${l.id}:g${i++}`;
+        if (m[1].trim().toLowerCase() === name && !char.lootSeen.includes(key)) found.push({ key, gold: Number(m[2]) });
+      }
+    }
+    if (!found.length) return;
+    const t = setTimeout(() => update((c) => {
+      let inventory = [...c.inventory];
+      let gold = c.gold;
+      for (const f of found) {
+        if (f.gold) gold += f.gold;
+        if (f.item) {
+          const ex = inventory.find((x) => x.name.toLowerCase() === f.item!.toLowerCase());
+          inventory = ex ? inventory.map((x) => (x === ex ? { ...x, qty: x.qty + 1 } : x)) : [...inventory, { id: newId(), name: f.item, qty: 1 }];
+        }
+      }
+      return { ...c, inventory, gold, lootSeen: [...c.lootSeen, ...found.map((f) => f.key)].slice(-200) };
+    }), 0);
+    return () => clearTimeout(t);
+  }, [state.log, char, update]);
 
+  // ---- gifts, healing and reactions from other players ----
+  const [floating, setFloating] = useState<{ id: string; emoji: string; who: string; left: number }[]>([]);
+  useEffect(() => onEvent((m: Msg) => {
+    const c = charRef.current;
+    if (m.type === "react") {
+      const f = { id: m.reaction.id, emoji: m.reaction.emoji, who: m.reaction.who, left: 10 + Math.random() * 80 };
+      setFloating((x) => [...x.slice(-14), f]);
+      setTimeout(() => setFloating((x) => x.filter((y) => y.id !== f.id)), 2700);
+    }
+    if (!c) return;
+    if (m.type === "give" && m.toId === c.id && !c.lootSeen.includes(m.id)) {
+      update((x) => {
+        let inventory = [...x.inventory];
+        if (m.item) {
+          const ex = inventory.find((i) => i.name.toLowerCase() === m.item!.name.toLowerCase());
+          inventory = ex ? inventory.map((i) => (i === ex ? { ...i, qty: i.qty + m.item!.qty } : i)) : [...inventory, { id: newId(), name: m.item.name, qty: m.item.qty }];
+        }
+        return { ...x, inventory, gold: x.gold + (m.gold ?? 0), lootSeen: [...x.lootSeen, m.id].slice(-200) };
+      });
+    }
+    if (m.type === "heal" && m.toId === c.id && !c.lootSeen.includes(m.id)) {
+      update((x) => ({ ...x, hp: x.hp + m.amount, lootSeen: [...x.lootSeen, m.id].slice(-200) }));
+    }
+  }), [onEvent, update]);
+
+  const heal = useCallback((toId: string, amount: number) => {
+    if (charRef.current && toId === charRef.current.id) update((c) => ({ ...c, hp: c.hp + amount }));
+    else send({ type: "heal", toId, amount, fromName: myName, id: newId() });
+    const who = partyChars.find((p) => p.id === toId)?.name ?? "the target";
+    log(`${myName} heals ${who === myName ? "themself" : who} for ${amount} HP.`);
+  }, [update, send, myName, partyChars, log]);
+
+  const give = useCallback((toId: string, item: { name: string; qty: number } | null, gold?: number) => {
+    send({ type: "give", toId, fromName: myName, item: item ?? undefined, gold, id: newId() });
+  }, [send, myName]);
+
+  // ---- roll requests from the AI ----
   function answerRequest(entry: LogEntry, req: RollReq) {
     if (!char) return;
     const isInit = /^init/i.test(req.check);
     const mod = checkMod(char, req.check);
     const reqId = `${entry.id}:${req.idx}`;
-    doRoll({
-      sides: 20, label: `${req.check}${req.target ? ` (${req.target})` : ""}`, mod, req: reqId,
+    const lc = req.check.toLowerCase();
+    const ability = (ABILITIES.find((a) => lc.startsWith(a.toLowerCase()) || lc.startsWith(ABILITY_NAMES[a].toLowerCase())) as Ability | undefined);
+    const kind = lc.startsWith("attack") ? "attack" : lc.includes("save") ? "save" : "check";
+    roll({
+      expr: `1d20${fmt(mod)}`, label: `${req.check}${req.target ? ` (${req.target})` : ""}`, kind, ability, req: reqId,
       after: (e) => {
         if (isInit) {
           const d = derive(char);
           send({ type: "init-upsert", entries: [{ id: char.id, name: char.name, init: e.total, kind: "pc", color: char.color, hp: Math.min(char.hp, d.maxHp), maxHp: d.maxHp, ac: d.ac }] });
         }
         if (!aiMode) return;
-        // When every roll this message asked for is in, hand them back to the AI DM.
         const reqs = parseRequests(entry.text);
-        const done = new Map(state.rolls.filter((r) => r.req?.startsWith(entry.id + ":")).map((r) => [r.req!, r]));
+        const done = new Map(stateRef.current.rolls.filter((r) => r.req?.startsWith(entry.id + ":")).map((r) => [r.req!, r]));
         done.set(reqId, e);
         const present = new Set(party.map((p) => p.character!.name.toLowerCase()));
         const outstanding = reqs.filter((r) => !done.has(`${entry.id}:${r.idx}`) && present.has(r.who.toLowerCase()));
@@ -324,12 +478,35 @@ function Session({ code, seat, char, setChar, me, room, leave }: {
           const summary = reqs
             .map((r) => {
               const x = done.get(`${entry.id}:${r.idx}`);
-              return x ? `${r.who} rolled ${r.check}${r.target ? ` vs ${r.target}` : ""}: ${x.total} (natural ${x.dice[0]}, ${fmt(x.modifier)})` : null;
+              return x ? `${r.who} rolled ${r.check}${r.target ? ` vs ${r.target}` : ""}: ${x.total} (natural ${x.nat ?? x.dice[0]}, ${fmt(x.modifier)})` : null;
             })
             .filter(Boolean)
             .join("; ");
           setTimeout(() => askDM(`Roll results — ${summary}. Resolve them and continue.`), 300);
         }
+      },
+    });
+  }
+
+  function trayRoll() {
+    if (die === 20 && count === 1 && char) {
+      if (check === "Initiative") return rollInitiative();
+      const lc = check.toLowerCase();
+      const ability = ABILITIES.find((a) => lc.startsWith(ABILITY_NAMES[a].toLowerCase()));
+      const kind = check === "Attack" ? "attack" : lc.includes("save") ? "save" : "check";
+      roll({ expr: `1d20${fmt(checkMod(char, check))}`, label: check, kind, ability, hidden: isDM && secret });
+    } else {
+      roll({ expr: `${count}d${die}`, label: `${count}d${die}`, kind: "free", hidden: isDM && secret });
+    }
+  }
+
+  function rollInitiative() {
+    if (!char) return;
+    roll({
+      expr: `1d20${fmt(checkMod(char, "Initiative"))}`, label: "Initiative", kind: "check", ability: "DEX",
+      after: (e) => {
+        const d = derive(char);
+        send({ type: "init-upsert", entries: [{ id: char.id, name: char.name, init: e.total, kind: "pc", color: char.color, hp: Math.min(char.hp, d.maxHp), maxHp: d.maxHp, ac: d.ac }] });
       },
     });
   }
@@ -341,19 +518,34 @@ function Session({ code, seat, char, setChar, me, room, leave }: {
     const text = draft.trim();
     if (!text) return;
     setDraft("");
-    const kind = isDM ? "dm" : "player";
-    send({ type: "log", entry: { id: newId(), kind, who: myName, color: myColor, text, at: Date.now() } });
+    send({ type: "log", entry: { id: newId(), kind: isDM ? "dm" : "player", who: myName, color: myColor, text, at: Date.now() } });
     if (aiMode && !isDM) askDM(`${myName}: ${text}`);
   }
 
-  // ---- HP ----
-  function changeHp(delta: number) {
-    if (!char) return;
-    const max = derive(char).maxHp;
-    const next = { ...char, hp: Math.max(0, Math.min(max, char.hp + delta)) };
-    saveCharacter(next);
-    setChar(next);
-    if (state.init.some((x) => x.id === char.id)) send({ type: "init-patch", id: char.id, hp: next.hp });
+  // ---- recap ----
+  const [recapBusy, setRecapBusy] = useState(false);
+  async function writeRecap() {
+    setRecapBusy(true);
+    setAiNote(null);
+    try {
+      await saveNow().catch(() => {});
+      const st = stateRef.current;
+      const res = await fetch("/api/recap", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ room: code, scene: st.scene, previous: st.recaps[st.recaps.length - 1]?.text, log: st.log.filter((l) => !l.streaming).map((l) => ({ who: l.who, kind: l.kind, text: l.text })) }),
+      });
+      if (!res.ok) {
+        setAiNote(await res.text());
+        return;
+      }
+      const { text } = (await res.json()) as { text: string };
+      send({ type: "recap", recap: { id: newId(), text, at: Date.now() } });
+    } catch {
+      setAiNote("Couldn't reach the recap writer.");
+    } finally {
+      setRecapBusy(false);
+    }
   }
 
   // ---- initiative ----
@@ -390,22 +582,13 @@ function Session({ code, seat, char, setChar, me, room, leave }: {
     for (const [id, t] of Object.entries(state.tokens)) m.set(`${t.x},${t.y}`, [id, t]);
     return m;
   }, [state.tokens]);
+  const condById = useMemo(() => new Map(partyChars.map((p) => [p.id, p.conditions ?? []])), [partyChars]);
   function clickCell(x: number, y: number) {
     const hit = byCell.get(`${x},${y}`);
     if (hit) return setSelected(hit[0]);
     if (!selected || !state.tokens[selected]) return;
     send({ type: "token", id: selected, token: { ...state.tokens[selected], x, y } });
   }
-
-  // ---- incoming roll toast ----
-  const [dismissed, setDismissed] = useState<string | null>(null);
-  const newestRoll = state.rolls[0];
-  const toast = newestRoll && newestRoll.id !== dismissed ? newestRoll : null;
-  useEffect(() => {
-    if (!newestRoll) return;
-    const t = setTimeout(() => setDismissed(newestRoll.id), 3500);
-    return () => clearTimeout(t);
-  }, [newestRoll]);
 
   // ---- log autoscroll ----
   const logRef = useRef<HTMLDivElement>(null);
@@ -414,16 +597,22 @@ function Session({ code, seat, char, setChar, me, room, leave }: {
     logRef.current?.scrollTo({ top: logRef.current.scrollHeight, behavior: "smooth" });
   }, [state.log.length, lastLog?.text]);
 
+  const [tab, setTab] = useState<StoryTab>("Story");
   const [copied, setCopied] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
   const d = char ? derive(char) : null;
-  const shownRoll = last;
-  const crit = !rolling && shownRoll?.nat === 20;
-  const fumble = !rolling && shownRoll?.nat === 1;
+  const shown = last;
+  const crit = !busy && shown?.nat === 20;
+  const fumble = !busy && shown?.nat === 1;
+  const skin = skinById(char?.diceSkin);
   const checkOptions = ["Attack", "Initiative", ...(Object.keys(SKILLS) as Skill[]), ...ABILITIES.map((a) => `${ABILITY_NAMES[a]} save`), ...ABILITIES.map((a) => ABILITY_NAMES[a])];
+  const latestRecap = state.recaps[state.recaps.length - 1];
+  const openQuests = state.journal.filter((j) => j.kind === "quest" && !j.done).length;
 
   return (
     <div className="flex min-h-screen flex-col">
+      <Dice3D throwData={throwData} />
+
       {/* ---------- header ---------- */}
       <header className="flex flex-wrap items-center gap-x-6 gap-y-3 border-b border-line bg-ink-2 px-4 py-3 md:px-6">
         <Link href="/" aria-label="Home"><Logo size={26} text={false} /></Link>
@@ -477,22 +666,23 @@ function Session({ code, seat, char, setChar, me, room, leave }: {
                 <button className="min-h-10 rounded-lg border border-line-2 px-3 text-sm text-soft">Set</button>
               </div>
             </form>
-            <button type="button" onClick={() => { if (confirm("Clear the story log, rolls, initiative and map for everyone?")) send({ type: "reset" }); }} className="min-h-10 rounded-lg border border-[#4A2A20] px-3 text-sm font-semibold text-[#F28B7E]">New session</button>
+            <button type="button" onClick={() => { if (confirm("Start a new session? This clears the story log, rolls, initiative and map for everyone. The journal, recaps and dice stats stay.")) send({ type: "reset" }); }} className="min-h-10 rounded-lg border border-[#4A2A20] px-3 text-sm font-semibold text-[#F28B7E]">New session</button>
             <button type="button" onClick={leave} className="min-h-10 rounded-lg border border-line-2 px-3 text-sm text-soft">Change seat</button>
           </div>
         )}
       </header>
 
       <div className="flex flex-1 flex-wrap gap-5 p-4 md:p-5">
-        {/* ---------- party ---------- */}
-        <aside className="order-3 flex flex-[1_1_250px] flex-col gap-3 lg:order-none lg:max-w-[290px]">
+        {/* ---------- party + sheet ---------- */}
+        <aside className="order-3 flex flex-[1_1_300px] flex-col gap-3 lg:order-none lg:max-w-[340px]">
           <Label>PARTY</Label>
           {party.length === 0 && <p className="text-sm text-muted">No one has a character seated yet.</p>}
           {party.map((m) => {
             const c = m.character!;
             const mine = c.id === char?.id;
             const turn = c.id === activeId;
-            const hp = mine && char ? char.hp : c.hp;
+            const max = mine && d ? d.maxHp : c.maxHp;
+            const hp = Math.min(max, mine && char ? char.hp : c.hp);
             return (
               <div key={c.id} className={`flex flex-col gap-2.5 rounded-xl border bg-panel p-3.5 ${turn ? "turn-pulse border-gold" : "border-line"}`}>
                 <div className="flex items-center gap-2.5">
@@ -506,12 +696,17 @@ function Session({ code, seat, char, setChar, me, room, leave }: {
                     <span className="font-display text-[15px] font-extrabold text-parch-hi">{c.ac}</span>
                   </div>
                 </div>
-                <div className="flex justify-between text-xs"><span className="text-muted">HP</span><b className="text-parch-hi">{hp} / {c.maxHp}</b></div>
-                <HpBar hp={hp} max={c.maxHp} />
+                <div className="flex justify-between text-xs"><span className="text-muted">HP</span><b className="text-parch-hi">{hp} / {max}</b></div>
+                <HpBar hp={hp} max={max} />
+                {(c.conditions ?? []).length > 0 && (
+                  <div className="flex flex-wrap gap-1">
+                    {c.conditions.map((n) => <span key={n} className="rounded-md bg-[#2E1C14] px-2 py-0.5 text-[11px] font-bold tracking-[.6px] text-[#F0956B]">{n.toUpperCase()}</span>)}
+                  </div>
+                )}
                 {mine && (
                   <div className="flex gap-2">
                     {[-5, -1, 1, 5].map((n) => (
-                      <button key={n} type="button" onClick={() => changeHp(n)} aria-label={`${n > 0 ? "Heal" : "Damage"} ${Math.abs(n)}`}
+                      <button key={n} type="button" onClick={() => update((x) => ({ ...x, hp: x.hp + n }))} aria-label={`${n > 0 ? "Heal" : "Damage"} ${Math.abs(n)}`}
                         className={`min-h-10 flex-1 rounded-lg text-sm font-bold ${n < 0 ? "border border-[#4A2A20] bg-[#2A1714] text-[#F28B7E]" : "border border-[#1F4A30] bg-[#16301F] text-[#6EE7A0]"}`}>
                         {n > 0 ? `+${n}` : n}
                       </button>
@@ -521,20 +716,19 @@ function Session({ code, seat, char, setChar, me, room, leave }: {
               </div>
             );
           })}
-          {d && char && (
-            <div className="flex flex-col gap-2 rounded-xl border border-line bg-panel p-3.5">
-              <Label>YOUR SHEET · PROF {fmt(d.prof)}</Label>
-              <div className="grid grid-cols-3 gap-1.5">
+          {char && d && (
+            <>
+              <div className="grid grid-cols-6 gap-1.5">
                 {ABILITIES.map((a) => (
-                  <button key={a} type="button" onClick={() => doRoll({ sides: 20, label: `${ABILITY_NAMES[a]} check`, mod: d.m(a) })}
+                  <button key={a} type="button" disabled={busy} onClick={() => roll({ expr: `1d20${fmt(d.m(a))}`, label: `${ABILITY_NAMES[a]} check`, kind: "check", ability: a })}
                     className="flex flex-col items-center rounded-lg border border-gold-line bg-gold-panel py-1.5" aria-label={`Roll ${ABILITY_NAMES[a]} check`}>
                     <span className="text-[10px] font-bold text-soft">{a}</span>
                     <span className="font-display text-base font-extrabold text-gold">{fmt(d.m(a))}</span>
                   </button>
                 ))}
               </div>
-              <span className="text-xs text-muted">Skills: {[...d.skills].map((s) => `${s} ${fmt(d.skillMod(s))}`).join(" · ")}</span>
-            </div>
+              <SheetPanel char={char} party={partyChars} engine={engine} update={update} log={(t) => log(t)} heal={heal} give={give} />
+            </>
           )}
         </aside>
 
@@ -546,61 +740,89 @@ function Session({ code, seat, char, setChar, me, room, leave }: {
                 const x = i % COLS, y = Math.floor(i / COLS);
                 const hit = byCell.get(`${x},${y}`);
                 const sel = hit && hit[0] === selected;
+                const conds = hit ? condById.get(hit[0]) ?? [] : [];
                 return (
-                  <button key={i} type="button" onClick={() => clickCell(x, y)} aria-label={hit ? hit[1].name : `Square ${x + 1}, ${y + 1}`}
-                    className="flex aspect-square items-center justify-center hover:brightness-125" style={{ background: (x + y) % 2 ? "#24252E" : "#272833" }}>
+                  <button key={i} type="button" onClick={() => clickCell(x, y)} aria-label={hit ? `${hit[1].name}${conds.length ? ` (${conds.join(", ")})` : ""}` : `Square ${x + 1}, ${y + 1}`}
+                    className="relative flex aspect-square items-center justify-center hover:brightness-125" style={{ background: (x + y) % 2 ? "#24252E" : "#272833" }}>
                     {hit && (
                       <span className="flex h-[78%] w-[78%] items-center justify-center rounded-full font-display text-[clamp(9px,1.1vw,15px)] font-extrabold text-ink transition-all"
                         style={{ background: hit[1].color, boxShadow: `0 0 0 3px ${hit[1].kind === "foe" ? "#2A1714" : "#0E0F14"}${sel ? ", 0 0 0 6px #E8B84A" : ""}` }}>
                         {hit[1].label}
                       </span>
                     )}
+                    {conds.length > 0 && <span className="absolute right-[8%] top-[8%] h-[22%] w-[22%] rounded-full border-2 border-ink bg-[#F0956B]" aria-hidden="true" />}
                   </button>
                 );
               })}
             </div>
             <div className="pointer-events-none absolute left-3 top-3 flex flex-wrap gap-2">
-              <span className="rounded-lg border border-gold-line bg-[rgba(14,15,20,.85)] px-2.5 py-1.5 font-display text-[13px] font-bold tracking-[1px] text-gold">{state.scene.toUpperCase()}</span>
-              <span className="rounded-lg border border-line bg-[rgba(14,15,20,.85)] px-2.5 py-1.5 text-xs font-semibold text-soft">Tap a token, then a square to move it</span>
+              <span className="hidden rounded-lg border border-gold-line sm:inline bg-[rgba(14,15,20,.85)] px-2.5 py-1.5 font-display text-[13px] font-bold tracking-[1px] text-gold">{state.scene.toUpperCase()}</span>
+              <span className="hidden rounded-lg border border-line bg-[rgba(14,15,20,.85)] px-2.5 py-1.5 text-xs font-semibold text-soft sm:inline">Tap a token, then a square to move it</span>
             </div>
-            {toast && (
-              <div key={toast.id} className="rise absolute bottom-3 right-3 flex items-center gap-3 rounded-xl border border-gold-line bg-[rgba(22,21,15,.95)] px-4 py-3" aria-live="polite">
-                <span className="h-3 w-3 rounded-full" style={{ background: toast.color }} />
-                <span className="text-sm text-soft"><b className="text-parch-hi">{toast.who}</b> · {toast.hidden && toast.byClient !== me.clientId ? "secret roll" : toast.label}</span>
-                <span className={`font-display text-2xl font-extrabold ${toast.nat === 20 ? "text-gold" : toast.nat === 1 ? "text-[#F28B7E]" : "text-parch-hi"}`}>
-                  {toast.hidden && toast.byClient !== me.clientId ? "?" : toast.total}
+            <div className="pointer-events-none absolute inset-0 overflow-hidden" aria-hidden="true">
+              {floating.map((f) => (
+                <span key={f.id} className="float-up absolute bottom-4 flex flex-col items-center" style={{ left: `${f.left}%` }}>
+                  <span className="text-4xl">{f.emoji}</span>
+                  <span className="rounded-md bg-[rgba(14,15,20,.8)] px-1.5 text-[11px] font-semibold text-soft">{f.who}</span>
                 </span>
-              </div>
-            )}
+              ))}
+            </div>
           </div>
 
-          <section aria-label="Story log" className="flex flex-col rounded-2xl border border-line bg-[#14151C]">
-            <div ref={logRef} className="flex max-h-[460px] min-h-[220px] flex-col gap-3.5 overflow-y-auto px-5 py-5">
-              {state.log.length === 0 && (
-                <div className="flex flex-col items-center gap-3 py-8 text-center">
-                  <span className="font-display text-xl font-bold text-parch-hi">The table is set.</span>
-                  <span className="max-w-md text-sm text-muted">{aiMode ? "When the party's seated, start the adventure and the AI DM will set the scene." : "DM: describe the opening scene below. Players: type what your character does."}</span>
-                  {aiMode && (
-                    <button type="button" disabled={dmBusy} onClick={() => askDM("Begin the adventure: introduce the setting, bring the party together, and present a hook.")}
-                      className="mt-2 min-h-12 rounded-xl bg-arcane px-6 font-display font-extrabold tracking-[1.5px] text-[#0B1322] disabled:opacity-50">BEGIN THE ADVENTURE</button>
-                  )}
-                </div>
-              )}
-              {state.log.map((l) => <LogLine key={l.id} entry={l} rolls={state.rolls} myName={char?.name} onRoll={answerRequest} canRoll={!rolling} />)}
+          <section aria-label="Story" className="flex flex-col rounded-2xl border border-line bg-[#14151C]">
+            <div className="flex flex-wrap gap-1 border-b border-line px-3 pt-3" role="tablist">
+              {(["Story", "Journal", "Recaps", "Stats"] as StoryTab[]).map((t) => (
+                <button key={t} type="button" role="tab" aria-selected={tab === t} onClick={() => setTab(t)}
+                  className={`min-h-10 rounded-t-lg px-4 text-sm font-semibold ${tab === t ? "border-b-2 border-gold text-parch-hi" : "text-muted"}`}>
+                  {t}{t === "Journal" && openQuests ? ` · ${openQuests}` : ""}
+                </button>
+              ))}
             </div>
-            <form onSubmit={submitAction} className="flex flex-wrap items-end gap-2.5 border-t border-line p-4">
-              <label className="flex flex-[1_1_320px] flex-col gap-1.5">
-                <span className="text-xs font-semibold text-muted">{isDM ? "Narrate as the DM" : char ? `What does ${char.name} do?` : "Say something"}</span>
-                <textarea rows={2} value={draft} onChange={(e) => setDraft(e.target.value)}
-                  onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); e.currentTarget.form?.requestSubmit(); } }}
-                  placeholder={isDM ? "The door creaks open onto a flooded chapel…" : "I raise my shield and charge…"}
-                  className="resize-none rounded-xl border border-line-2 bg-[#0F1016] px-3.5 py-3 text-[15px] text-parch placeholder:text-[#6B7080]" />
-              </label>
-              <button type="submit" className="min-h-12 rounded-xl bg-gold px-5 font-bold text-gold-ink">{aiMode && !isDM ? "Send to DM" : "Send"}</button>
-              {aiMode && state.log.length > 0 && (
-                <button type="button" disabled={dmBusy} onClick={() => askDM("Continue the story from where it left off.")} className="min-h-12 rounded-xl border border-arcane-line px-4 text-sm font-semibold text-arcane-soft disabled:opacity-50">Continue</button>
-              )}
-            </form>
+            {tab === "Story" && (
+              <>
+                <div ref={logRef} className="flex max-h-[460px] min-h-[220px] flex-col gap-3.5 overflow-y-auto px-5 py-5">
+                  {latestRecap && state.log.length < 4 && (
+                    <article className="rise flex flex-col gap-2 rounded-xl border border-arcane-line bg-arcane-panel p-4">
+                      <span className="text-[11px] font-bold tracking-[1.8px] text-arcane-soft">PREVIOUSLY ON…</span>
+                      <p className="m-0 font-story text-lg leading-relaxed text-parch">{latestRecap.text}</p>
+                    </article>
+                  )}
+                  {state.log.length === 0 && (
+                    <div className="flex flex-col items-center gap-3 py-8 text-center">
+                      <span className="font-display text-xl font-bold text-parch-hi">The table is set.</span>
+                      <span className="max-w-md text-sm text-muted">{aiMode ? "When the party's seated, start the adventure and the AI DM will set the scene." : "DM: describe the opening scene below. Players: type what your character does."}</span>
+                      {aiMode && (
+                        <button type="button" disabled={dmBusy} onClick={() => askDM(latestRecap ? "Open the new session: briefly recall where we left off, then continue the story." : "Begin the adventure: introduce the setting, bring the party together, and present a hook.")}
+                          className="mt-2 min-h-12 rounded-xl bg-arcane px-6 font-display font-extrabold tracking-[1.5px] text-[#0B1322] disabled:opacity-50">{latestRecap ? "CONTINUE THE CAMPAIGN" : "BEGIN THE ADVENTURE"}</button>
+                      )}
+                    </div>
+                  )}
+                  {state.log.map((l) => <LogLine key={l.id} entry={l} rolls={state.rolls} myName={char?.name} onRoll={answerRequest} canRoll={!busy} />)}
+                </div>
+                <div className="flex flex-wrap gap-1.5 border-t border-line px-4 pt-3" aria-label="Reactions">
+                  {REACTIONS.map((e) => (
+                    <button key={e} type="button" aria-label={`React ${e}`} onClick={() => send({ type: "react", reaction: { id: newId(), emoji: e, who: myName, color: myColor } })}
+                      className="h-10 w-10 rounded-lg bg-panel-2 text-xl transition hover:scale-110">{e}</button>
+                  ))}
+                </div>
+                <form onSubmit={submitAction} className="flex flex-wrap items-end gap-2.5 p-4">
+                  <label className="flex flex-[1_1_320px] flex-col gap-1.5">
+                    <span className="text-xs font-semibold text-muted">{isDM ? "Narrate as the DM" : char ? `What does ${char.name} do?` : "Say something"}</span>
+                    <textarea rows={2} value={draft} onChange={(e) => setDraft(e.target.value)}
+                      onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); e.currentTarget.form?.requestSubmit(); } }}
+                      placeholder={isDM ? "The door creaks open onto a flooded chapel…" : "I raise my shield and charge…"}
+                      className="resize-none rounded-xl border border-line-2 bg-[#0F1016] px-3.5 py-3 text-[15px] text-parch placeholder:text-[#6B7080]" />
+                  </label>
+                  <button type="submit" className="min-h-12 rounded-xl bg-gold px-5 font-bold text-gold-ink">{aiMode && !isDM ? "Send to DM" : "Send"}</button>
+                  {aiMode && state.log.length > 0 && (
+                    <button type="button" disabled={dmBusy} onClick={() => askDM("Continue the story from where it left off.")} className="min-h-12 rounded-xl border border-arcane-line px-4 text-sm font-semibold text-arcane-soft disabled:opacity-50">Continue</button>
+                  )}
+                </form>
+              </>
+            )}
+            {tab === "Journal" && <JournalPanel journal={state.journal} send={send} me={myName} />}
+            {tab === "Recaps" && <RecapsPanel recaps={state.recaps} busy={recapBusy} onRecap={writeRecap} aiNote={aiNote} />}
+            {tab === "Stats" && <StatsPanel stats={state.stats} />}
           </section>
         </main>
 
@@ -608,12 +830,12 @@ function Session({ code, seat, char, setChar, me, room, leave }: {
         <aside className="order-2 flex flex-[1_1_280px] flex-col gap-3.5 lg:order-none lg:max-w-[330px]">
           <section aria-label="Dice tray" className="flex flex-col items-center gap-4 rounded-2xl border border-gold-line bg-gold-panel px-4 py-5">
             <span className="self-start"><Label>DICE TRAY</Label></span>
-            <D20 value={shownRoll ? shownRoll.total : 20} rolling={rolling} spin={rollCount} sides={die} size={140} crit={crit} fumble={fumble} />
+            <D20 value={shown ? shown.total : 20} rolling={busy} spin={state.rolls.length} sides={die} size={120} crit={crit} fumble={fumble} />
             <div className="flex min-h-[48px] flex-col items-center">
               <span className={`font-display text-2xl font-extrabold ${crit ? "text-gold" : fumble ? "text-[#F28B7E]" : "text-parch-hi"}`}>
-                {rolling ? "Rolling…" : crit ? "CRITICAL!" : fumble ? "FUMBLE" : shownRoll ? `${shownRoll.total}` : "Ready"}
+                {busy ? "Rolling…" : crit ? "CRITICAL!" : fumble ? "FUMBLE" : shown ? `${shown.total}` : "Ready"}
               </span>
-              <span className="text-center text-sm text-soft">{rolling ? "The table is watching" : shownRoll ? `${shownRoll.label} · ${shownRoll.expr} → ${shownRoll.dice.join(", ")}` : "Pick a die and roll"}</span>
+              <span className="text-center text-sm text-soft">{busy ? "The table is watching" : shown ? `${shown.label} · ${shown.expr}` : `Dice skin: ${skin.name}`}</span>
             </div>
             <div className="grid w-full grid-cols-7 gap-1.5">
               {DICE.map((n) => (
@@ -635,12 +857,21 @@ function Session({ code, seat, char, setChar, me, room, leave }: {
                 </label>
               )}
             </div>
+            <div className="grid w-full grid-cols-4 gap-1.5" role="radiogroup" aria-label="Advantage">
+              {([["auto", "Auto"], ["adv", "Adv"], ["normal", "Normal"], ["dis", "Dis"]] as const).map(([k, l]) => (
+                <button key={k} type="button" role="radio" aria-checked={trayMode === k} onClick={() => setTrayMode(k)}
+                  className={`min-h-9 rounded-lg text-xs font-bold ${trayMode === k ? "bg-[#33291A] text-gold ring-1 ring-gold" : "border border-gold-line text-[#D9CFB5]"}`}>{l}</button>
+              ))}
+            </div>
+            {trayMode === "auto" && char && char.conditions.length > 0 && (
+              <span className="self-start text-xs text-[#F0956B]">Conditions apply: {char.conditions.join(", ")}</span>
+            )}
             {isDM && (
               <label className="flex items-center gap-2 self-start text-sm text-soft">
                 <input type="checkbox" checked={secret} onChange={(e) => setSecret(e.target.checked)} className="h-5 w-5 accent-[#E8B84A]" /> Secret roll (only you see it)
               </label>
             )}
-            <button type="button" onClick={trayRoll} disabled={rolling}
+            <button type="button" onClick={trayRoll} disabled={busy}
               className="min-h-14 w-full rounded-xl bg-gold font-display text-lg font-extrabold tracking-[2px] text-gold-ink disabled:opacity-60">
               ROLL {count > 1 ? count : ""}D{die}
             </button>
@@ -650,7 +881,7 @@ function Session({ code, seat, char, setChar, me, room, leave }: {
             <div className="flex items-center justify-between">
               <Label>INITIATIVE</Label>
               <div className="flex gap-2">
-                {char && <button type="button" onClick={rollInitiative} className="min-h-9 rounded-lg border border-gold px-2.5 text-xs font-semibold text-gold">Roll mine</button>}
+                {char && <button type="button" onClick={rollInitiative} disabled={busy} className="min-h-9 rounded-lg border border-gold px-2.5 text-xs font-semibold text-gold">Roll mine</button>}
                 <button type="button" onClick={nextTurn} disabled={!state.init.length} className="min-h-9 rounded-lg bg-panel-2 px-2.5 text-xs font-semibold text-parch disabled:opacity-40">Next turn</button>
               </div>
             </div>
@@ -659,7 +890,7 @@ function Session({ code, seat, char, setChar, me, room, leave }: {
               <div key={i.id} className={`flex items-center gap-2 rounded-lg px-2.5 py-2 ${i.id === activeId ? "bg-[#2A2312]" : ""}`}>
                 <span className="w-7 text-center font-display font-extrabold text-gold">{i.init}</span>
                 <span className="h-2.5 w-2.5 shrink-0 rounded-full" style={{ background: i.color ?? "#C9CDD9" }} />
-                <span className="min-w-0 flex-1 truncate text-sm font-semibold text-parch-hi">{i.name}</span>
+                <span className={`min-w-0 flex-1 truncate text-sm font-semibold ${i.kind === "foe" && i.hp === 0 ? "text-muted line-through" : "text-parch-hi"}`}>{i.name}</span>
                 {i.kind === "foe" && i.maxHp ? (
                   <span className="flex items-center gap-1 text-xs text-soft">
                     <button type="button" aria-label={`Damage ${i.name}`} onClick={() => foeHpChange(i.id, -1)} className="h-7 w-7 rounded-md bg-[#2A1714] text-[#F28B7E]">−</button>
@@ -706,6 +937,7 @@ function Session({ code, seat, char, setChar, me, room, leave }: {
 
 function LogLine({ entry, rolls, myName, onRoll, canRoll }: { entry: LogEntry; rolls: RollEntry[]; myName?: string; onRoll: (e: LogEntry, r: RollReq) => void; canRoll: boolean }) {
   const reqs = entry.kind === "ai" && !entry.streaming ? parseRequests(entry.text) : [];
+  const loot = entry.kind === "ai" && !entry.streaming ? lootLines(entry.text) : [];
   const tag =
     entry.kind === "ai" ? ["AI DM", "bg-[#1E2C4A] text-arcane-soft"] :
     entry.kind === "dm" ? ["DM", "bg-[#33291A] text-gold"] :
@@ -723,6 +955,11 @@ function LogLine({ entry, rolls, myName, onRoll, canRoll }: { entry: LogEntry; r
           {text || (entry.streaming ? "…" : "")}
           {entry.streaming && <span className="ml-1 inline-block h-4 w-2 animate-pulse bg-arcane align-middle" aria-hidden="true" />}
         </p>
+        {loot.length > 0 && (
+          <div className="flex flex-wrap gap-2">
+            {loot.map((l) => <span key={l} className="rounded-lg border border-gold-line bg-gold-panel px-3 py-1.5 text-xs font-semibold text-gold">{l}</span>)}
+          </div>
+        )}
         {reqs.length > 0 && (
           <div className="flex flex-wrap gap-2">
             {reqs.map((r) => {

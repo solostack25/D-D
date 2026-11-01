@@ -36,6 +36,10 @@ export interface RollEntry {
   nat: number | null;
   hidden?: boolean; // DM secret roll
   req?: string; // roll request this answers ("<logId>:<index>")
+  parts?: { sides: number; value: number; dropped?: boolean }[];
+  mode?: "normal" | "adv" | "dis";
+  skin?: string;
+  kind?: "check" | "attack" | "damage" | "heal" | "save" | "free";
   byClient: string;
   at: number;
 }
@@ -60,6 +64,39 @@ export interface Token {
   name: string;
 }
 
+export interface JournalEntry {
+  id: string;
+  kind: "npc" | "place" | "quest" | "loot" | "note";
+  title: string;
+  text?: string;
+  done?: boolean;
+  by?: string;
+  at: number;
+}
+
+export interface Recap {
+  id: string;
+  text: string;
+  at: number;
+}
+
+export interface DiceStats {
+  rolls: number;
+  d20s: number;
+  d20sum: number;
+  nat20: number;
+  nat1: number;
+  best: number;
+  color?: string;
+}
+
+export interface Reaction {
+  id: string;
+  emoji: string;
+  who: string;
+  color?: string;
+}
+
 export interface RoomState {
   mode: "ai" | "human";
   tone: string;
@@ -71,6 +108,9 @@ export interface RoomState {
   round: number;
   turnTaken?: boolean; // becomes true once someone presses "Next turn"
   tokens: Record<string, Token>;
+  journal: JournalEntry[];
+  recaps: Recap[];
+  stats: Record<string, DiceStats>;
   updatedAt: number;
 }
 
@@ -84,8 +124,14 @@ export const initialRoom = (): RoomState => ({
   turn: 0,
   round: 1,
   tokens: {},
+  journal: [],
+  recaps: [],
+  stats: {},
   updatedAt: 0,
 });
+
+/** Fill in fields added after a room was first saved. */
+export const normalizeRoom = (s: Partial<RoomState>): RoomState => ({ ...initialRoom(), ...s });
 
 export type Msg =
   | { type: "log"; entry: LogEntry }
@@ -100,6 +146,13 @@ export type Msg =
   | { type: "token"; id: string; token: Token | null }
   | { type: "hello"; from: string }
   | { type: "snapshot"; to: string; state: RoomState }
+  | { type: "journal-add"; entry: JournalEntry }
+  | { type: "journal-update"; id: string; patch: Partial<JournalEntry> }
+  | { type: "journal-remove"; id: string }
+  | { type: "recap"; recap: Recap }
+  | { type: "react"; reaction: Reaction }
+  | { type: "give"; toId: string; fromName: string; item?: { name: string; qty: number }; gold?: number; id: string }
+  | { type: "heal"; toId: string; fromName: string; amount: number; id: string }
   | { type: "reset" };
 
 function reduce(s: RoomState, m: Msg): RoomState {
@@ -113,9 +166,31 @@ function reduce(s: RoomState, m: Msg): RoomState {
       if (!exists) return { ...s, log: [...s.log, { id: m.id, kind: "ai" as const, who: "AI DM", text: m.text, at: now, streaming: m.streaming }].slice(-200), updatedAt: now };
       return { ...s, log: s.log.map((l) => (l.id === m.id ? { ...l, text: m.text, streaming: m.streaming } : l)), updatedAt: now };
     }
-    case "roll":
+    case "roll": {
       if (s.rolls.some((r) => r.id === m.entry.id)) return s;
-      return { ...s, rolls: [m.entry, ...s.rolls].slice(0, 60), updatedAt: now };
+      const e = m.entry;
+      const st = { ...(s.stats[e.who] ?? { rolls: 0, d20s: 0, d20sum: 0, nat20: 0, nat1: 0, best: 0 }) };
+      st.rolls += 1;
+      st.color = e.color;
+      if (e.nat != null && !e.hidden) {
+        st.d20s += 1;
+        st.d20sum += e.nat;
+        if (e.nat === 20) st.nat20 += 1;
+        if (e.nat === 1) st.nat1 += 1;
+      }
+      if (!e.hidden) st.best = Math.max(st.best, e.total);
+      return { ...s, rolls: [e, ...s.rolls].slice(0, 60), stats: { ...s.stats, [e.who]: st }, updatedAt: now };
+    }
+    case "journal-add":
+      if (s.journal.some((j) => j.id === m.entry.id || (j.kind === m.entry.kind && j.title.toLowerCase() === m.entry.title.toLowerCase()))) return s;
+      return { ...s, journal: [...s.journal, m.entry].slice(-300), updatedAt: now };
+    case "journal-update":
+      return { ...s, journal: s.journal.map((j) => (j.id === m.id ? { ...j, ...m.patch } : j)), updatedAt: now };
+    case "journal-remove":
+      return { ...s, journal: s.journal.filter((j) => j.id !== m.id), updatedAt: now };
+    case "recap":
+      if (s.recaps.some((r) => r.id === m.recap.id)) return s;
+      return { ...s, recaps: [...s.recaps, m.recap].slice(-30), updatedAt: now };
     case "settings":
       return { ...s, mode: m.mode ?? s.mode, tone: m.tone ?? s.tone, scene: m.scene ?? s.scene, updatedAt: now };
     case "init":
@@ -142,7 +217,8 @@ function reduce(s: RoomState, m: Msg): RoomState {
       return { ...s, tokens, updatedAt: now };
     }
     case "reset":
-      return { ...initialRoom(), mode: s.mode, tone: s.tone, updatedAt: now };
+      // new session: clear the table but keep the campaign (journal, recaps, stats, scene)
+      return { ...initialRoom(), mode: s.mode, tone: s.tone, scene: s.scene, journal: s.journal, recaps: s.recaps, stats: s.stats, updatedAt: now };
     default:
       return s;
   }
@@ -150,7 +226,7 @@ function reduce(s: RoomState, m: Msg): RoomState {
 
 type Action = { msg: Msg } | { replace: RoomState };
 function reducer(s: RoomState, a: Action) {
-  return "replace" in a ? a.replace : reduce(s, a.msg);
+  return "replace" in a ? normalizeRoom(a.replace) : reduce(s, a.msg);
 }
 
 interface Transport {
@@ -259,6 +335,7 @@ export function useRoom(code: string, me: Member | null) {
   const [members, setMembers] = useState<Member[]>([]);
   const [live, setLive] = useState(false);
   const t = useRef<Transport | null>(null);
+  const listeners = useRef(new Set<(m: Msg) => void>());
   const stateRef = useRef(state);
   useEffect(() => {
     stateRef.current = state;
@@ -316,6 +393,10 @@ export function useRoom(code: string, me: Member | null) {
         if (m.to === clientId && m.state.updatedAt > stateRef.current.updatedAt) dispatch({ replace: m.state });
         return;
       }
+      if (m.type === "react" || m.type === "give" || m.type === "heal") {
+        listeners.current.forEach((fn) => fn(m));
+        return;
+      }
       dispatch({ msg: m });
     };
     const transport = realtimeEnabled ? supabaseTransport(code, clientId, onMsg, setMembers) : localTransport(code, clientId, onMsg, setMembers);
@@ -334,7 +415,23 @@ export function useRoom(code: string, me: Member | null) {
   }, [meKey, live]);
 
   const send = useCallback((m: Msg) => t.current?.send(m), []);
-  return { state, members, send, live };
+  /** Listen for one-off events (reactions, gifts) that aren't stored in the room. */
+  const onEvent = useCallback((fn: (m: Msg) => void) => {
+    listeners.current.add(fn);
+    return () => {
+      listeners.current.delete(fn);
+    };
+  }, []);
+
+  /** Write the room to the cloud right away (the AI DM only answers for saved rooms). */
+  const saveNow = useCallback(async () => {
+    const sb = supabase();
+    if (!sb) return;
+    const st = stateRef.current;
+    await sb.rpc("room_put", { p_code: code, p_state: { ...st, updatedAt: st.updatedAt || Date.now(), rolls: st.rolls.slice(0, 30), log: st.log.filter((l) => !l.streaming).slice(-150) } });
+  }, [code]);
+
+  return { state, members, send, live, onEvent, saveNow };
 }
 
 export const newId = () => Math.random().toString(36).slice(2, 10) + Date.now().toString(36).slice(-3);
